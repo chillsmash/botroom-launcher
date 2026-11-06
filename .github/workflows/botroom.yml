@@ -1,0 +1,211 @@
+name: botroom
+
+# PUBLIC launcher.  Holds no program logic: the bundle (client build + host scripts) is downloaded at run time from the
+# private repo $BUNDLE_REPO with a read-only token.  Do not add steps that print the bundle (ls/cat/set -x/artifacts).
+
+# Started and cancelled by the bot room controller (workflow_dispatch / runs API).
+on:
+  workflow_dispatch:
+    inputs:
+      limit_min:
+        description: Game limit time in minutes (empty = repo default)
+        required: false
+        default: ""
+      engine:
+        description: "Host engine: node (headless Node.js client, default) or chrome (old headless Chromium path); empty = repo variable BR_ENGINE"
+        required: false
+        default: ""
+
+# Never two hosts: a second dispatch waits for the running one instead of replacing it.
+concurrency:
+  group: botroom
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  host:
+    runs-on: ubuntu-latest
+    timeout-minutes: 355
+    env:
+      # node: headless Node.js build of the client (default).  chrome: the previous headless Chromium host, kept as a
+      # fallback: set the repo variable BR_ENGINE=chrome (or dispatch with engine=chrome); its bundle is the release
+      # tagged BR_CHROME_TAG (the newest Chromium bundle), not the latest one.
+      ENGINE: ${{ inputs.engine || vars.BR_ENGINE || 'node' }}
+      CHROME_TAG: ${{ vars.BR_CHROME_TAG || 'bundle-5ba6dec-6d3522e' }}
+      # x64 Chrome for Testing build of the arm64 chromium_headless_shell-1248 used locally.
+      CHROME_VERSION: 156.0.8078.4
+      # Plain absolute paths (no ".."): the host's static server compares normalized paths.
+      BUNDLE_DIR: /home/runner/botroom-bundle
+      CHROME_DIR: /home/runner/botroom-chrome
+    steps:
+      # Built-in WebSocket (no npm packages); the runner image's own Node is 20.
+      - name: Node 22
+        if: env.ENGINE != 'chrome'
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          package-manager-cache: false
+
+      # No checkout and no cache: the bundle (client build + asset cache + host scripts, a release asset) is
+      # downloaded as several Range requests at once (node: the latest release; chrome: also the headless shell,
+      # in parallel).  A cache restore was slower than the download (7.7 s + 3.6 s measured), so nothing is cached.
+      - name: Run host
+        id: host
+        env:
+          # Read-only (Contents) fine-grained PAT limited to the PRIVATE bundle repo.  Never printed; secrets are masked.
+          GH_TOKEN: ${{ secrets.BUNDLE_TOKEN }}
+          BUNDLE_REPO: ${{ vars.BUNDLE_REPO }}
+          BR_SERVER: ${{ secrets.BR_SERVER }}
+          BR_USER: ${{ secrets.BR_USER }}
+          BR_PASSWORD: ${{ secrets.BR_PASSWORD }}
+          BR_LIMIT_MIN: ${{ inputs.limit_min || vars.BR_LIMIT_MIN || '60' }}
+          BR_BOTS: ${{ vars.BR_BOTS || '2' }}
+          BR_ROOM: ${{ vars.BR_ROOM || '[24h] Bot Arena' }}
+          # Several hosts in this one job (run-host.sh): e.g. repo variable BR_HOSTS = "arena tdm".  Empty = one host
+          # (the plain BR_* settings above).  The first name uses the plain settings; "tdm" below is a 4 vs 4 team
+          # deathmatch room on Town with the host and 7 bots, its own account (secrets BR_TDM_USER / BR_TDM_PASSWORD, in
+          # server.ini [BOT] HostAccounts; the server also needs [BOT] AllowTeamDeathmatch=1).
+          BR_HOSTS: ${{ vars.BR_HOSTS || '' }}
+          BR_FAIL_POLICY: ${{ vars.BR_FAIL_POLICY || 'keep' }}
+          BR_H_TDM_USER: ${{ secrets.BR_TDM_USER }}
+          BR_H_TDM_PASSWORD: ${{ secrets.BR_TDM_PASSWORD }}
+          BR_H_TDM_ROOM: ${{ vars.BR_TDM_ROOM || '[24h] TDM Arena' }}
+          BR_H_TDM_GAMETYPE: "9"
+          BR_H_TDM_MAP: ${{ vars.BR_TDM_MAP || 'Town' }}
+          BR_H_TDM_MAX_PLAYERS: ${{ vars.BR_TDM_MAX_PLAYERS || '8' }}
+          BR_H_TDM_BOTS: ${{ vars.BR_TDM_BOTS || '7' }}
+          BR_H_TDM_ROUND_MAX: ${{ vars.BR_TDM_ROUND_MAX || '100' }}
+          BR_H_TDM_LIMIT_MIN: ${{ vars.BR_TDM_LIMIT_MIN || '60' }}
+          BR_BUILD: ${{ env.BUNDLE_DIR }}/build
+          GUNZ_ASSET_CACHE_DIR: ${{ env.BUNDLE_DIR }}/asset-cache
+          BR_ENGINE: ${{ env.ENGINE }}
+          BR_CHROME: ${{ env.CHROME_DIR }}/chrome-headless-shell-linux64/chrome-headless-shell
+          BR_OUT: ${{ runner.temp }}/botroom
+          # Clean exit at the last game end before 5 h 45 min; hard stop at 5 h 50 min.
+          BR_END_BY_MIN: "345"
+          BR_MAX_MINUTES: "350"
+          BR_MAX_FAIL_STREAK: "5"
+          BR_SAMPLE_S: "300"
+          BR_PROGRESS_MIN: "5"
+          # Exit when no visitor has been in the room for N minutes (0 = never); the controller then waits for a new login.
+          BR_IDLE_EXIT_MIN: ${{ vars.BR_IDLE_EXIT_MIN || '10' }}
+          # Last look before that exit: the controller's /last-login (read-only token).  A login less than N minutes ago
+          # postpones the exit.  Either one unset = no check (exit as before).
+          BR_LOGIN_URL: ${{ vars.BR_LOGIN_URL || '' }}
+          BR_LOGIN_TOKEN: ${{ secrets.BR_LOGIN_TOKEN }}
+        run: |
+          set -euo pipefail
+          T0=$(date +%s.%N)
+          lap() { awk -v a="$T0" -v b="$(date +%s.%N)" -v m="$1" 'BEGIN{printf "fetch %-22s +%.1f s\n", m, b-a}'; }
+
+          # pfetch URL OUT SIZE N: N parallel Range requests, joined into OUT.
+          pfetch() {
+            local url=$1 out=$2 size=$3 n=$4 i a b pids=() ok=0
+            local chunk=$(( (size + n - 1) / n ))
+            for i in $(seq 0 $((n - 1))); do
+              a=$((i * chunk)); b=$(( (i + 1) * chunk - 1 )); [ "$b" -ge "$size" ] && b=$((size - 1))
+              curl -fsS --retry 3 -r "$a-$b" -o "$out.$i" "$url" & pids+=($!)
+            done
+            for i in "${pids[@]}"; do wait "$i" || ok=1; done
+            [ "$ok" = 0 ] && cat "$out".* > "$out" && rm -f "$out".[0-9]*
+            return "$ok"
+          }
+
+          fetch_bundle() {
+            mkdir -p "$BUNDLE_DIR"
+            local id size url rel=latest
+            [ "$ENGINE" = chrome ] && rel="tags/$CHROME_TAG"
+            read -r id size < <(gh api "repos/$BUNDLE_REPO/releases/$rel" --jq '.assets[] | select(.name == "bundle.tar.gz") | "\(.id) \(.size)"')
+            url=$(curl -fsS -o /dev/null -w '%{redirect_url}' -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/octet-stream" "https://api.github.com/repos/$BUNDLE_REPO/releases/assets/$id")
+            pfetch "$url" "$RUNNER_TEMP/bundle.tar.gz" "$size" 4 && tar -xzf "$RUNNER_TEMP/bundle.tar.gz" -C "$BUNDLE_DIR" && rm -f "$RUNNER_TEMP/bundle.tar.gz"
+          }
+          fetch_chrome() {
+            mkdir -p "$CHROME_DIR"
+            local url="https://storage.googleapis.com/chrome-for-testing-public/$CHROME_VERSION/linux64/chrome-headless-shell-linux64.zip" size
+            size=$(curl -fsSI "$url" | tr -d '\r' | awk 'tolower($1) == "content-length:" {s = $2} END {print s}')
+            pfetch "$url" "$RUNNER_TEMP/chs.zip" "$size" 3 && unzip -q "$RUNNER_TEMP/chs.zip" -d "$CHROME_DIR" && rm -f "$RUNNER_TEMP/chs.zip"
+          }
+
+          fetch_bundle & BP=$!
+          if [ "$ENGINE" = chrome ]; then fetch_chrome & CP=$!; fi
+          if ! wait "$BP"; then
+            echo "parallel bundle fetch failed; plain download"
+            rm -rf "$BUNDLE_DIR" "$RUNNER_TEMP"/bundle.tar.gz*; mkdir -p "$BUNDLE_DIR"
+            if [ "$ENGINE" = chrome ]; then gh release download "$CHROME_TAG" --repo "$BUNDLE_REPO" -p bundle.tar.gz -O - | tar -xz -C "$BUNDLE_DIR"
+            else gh release download --repo "$BUNDLE_REPO" -p bundle.tar.gz -O - | tar -xz -C "$BUNDLE_DIR"; fi
+          fi
+          if [ "$ENGINE" = chrome ] && ! wait "$CP"; then
+            echo "parallel headless shell fetch failed; plain download"
+            rm -rf "$CHROME_DIR" "$RUNNER_TEMP"/chs.zip*; mkdir -p "$CHROME_DIR"
+            curl -fsSL -o "$RUNNER_TEMP/chs.zip" "https://storage.googleapis.com/chrome-for-testing-public/$CHROME_VERSION/linux64/chrome-headless-shell-linux64.zip"
+            unzip -q "$RUNNER_TEMP/chs.zip" -d "$CHROME_DIR"
+          fi
+          lap "bundle ready"
+          cat "$BUNDLE_DIR/BUILD"
+
+          if [ "$ENGINE" != chrome ]; then
+            # Node host: supervisor (restarts on failure, kills a hung host) -> bot-room-node.mjs.  exec: SIGINT on a
+            # cancel reaches the supervisor, which forwards it so the host leaves the battle and exits.
+            node --version
+            lap "host starts"
+            exec bash "$BUNDLE_DIR/scripts/run-host.sh"
+          fi
+
+          # Missing shared libraries are installed only when the runner image lacks them.
+          missing=$(ldd "$BR_CHROME" | awk '/not found/{print $1}')
+          if [ -n "$missing" ]; then
+            echo "missing: $missing"
+            sudo apt-get update -qq && sudo apt-get install -y -qq libnss3 libnspr4 libgbm1 libasound2t64 libxkbcommon0 libxcomposite1 libxdamage1 libxrandr2 libatk1.0-0t64 libatk-bridge2.0-0t64 libcups2t64 libpango-1.0-0 libcairo2 > /dev/null
+          fi
+          lap "host starts"
+          # SIGINT on cancel goes to node (exec): it leaves the battle, closes the browser and exits.
+          exec node "$BUNDLE_DIR/scripts/bot-room.mjs"
+
+      # The controller reads this step's conclusion (runs API, jobs): success = the host stopped because nobody came, so
+      # it is not started again until a new player logs in.  Skipped on every other exit.
+      - name: Idle exit
+        if: steps.host.outputs.idle == '1'
+        run: echo "no visitor for ${BR_IDLE_EXIT_MIN:-10} min; the host stopped"
+        env:
+          BR_IDLE_EXIT_MIN: ${{ vars.BR_IDLE_EXIT_MIN || '10' }}
+
+      # Visitors of this run (who came into a room, when, how long): the job summary (one table per room) and one
+      # artifact per room (visits.jsonl).  One host: $RUNNER_TEMP/botroom/visits.jsonl; several: botroom/<name>/.
+      - name: Visitors
+        if: always()
+        run: |
+          shopt -s nullglob
+          shown=0
+          for f in "$RUNNER_TEMP"/botroom/visits.jsonl "$RUNNER_TEMP"/botroom/*/visits.jsonl; do
+            [ -s "$f" ] || continue
+            shown=1
+            room=$(basename "$(dirname "$f")"); title="Visitors"; [ "$room" = botroom ] || title="Visitors - $room"
+            {
+              echo "### $title ($(wc -l < "$f"))"
+              echo
+              echo "| name | in (UTC) | out (UTC) | stay | why |"
+              echo "|---|---|---|---|---|"
+              jq -r '"| \(.name) | \(.in[0:19] | sub("T"; " ")) | \(.out[0:19] | sub("T"; " ")) | \(.staySec / 60 | floor) min \(.staySec % 60) s | \(.why) |"' "$f"
+            } | tee -a "$GITHUB_STEP_SUMMARY"
+          done
+          [ "$shown" = 1 ] || echo "no visitors"
+      - name: Upload visitors
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: visits-${{ github.run_id }}
+          path: |
+            ${{ runner.temp }}/botroom/visits.jsonl
+            ${{ runner.temp }}/botroom/arena/visits.jsonl
+          if-no-files-found: ignore
+          retention-days: 90
+      - name: Upload visitors (tdm)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: visits-${{ github.run_id }}-tdm
+          path: ${{ runner.temp }}/botroom/tdm/visits.jsonl
+          if-no-files-found: ignore
+          retention-days: 90
