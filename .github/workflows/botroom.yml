@@ -62,6 +62,7 @@ jobs:
           BR_PASSWORD: ${{ secrets.BR_PASSWORD }}
           BR_LIMIT_MIN: ${{ inputs.limit_min || vars.BR_LIMIT_MIN || '60' }}
           BR_BOTS: ${{ vars.BR_BOTS || '2' }}
+          BR_AIM: ${{ vars.BR_AIM || 'normal' }}
           BR_ROOM: ${{ vars.BR_ROOM || '[24h] Bot Arena' }}
           # Several hosts in this one job (run-host.sh): e.g. repo variable BR_HOSTS = "arena tdm".  Empty = one host
           # (the plain BR_* settings above).  The first name uses the plain settings; "tdm" below is a 4 vs 4 team
